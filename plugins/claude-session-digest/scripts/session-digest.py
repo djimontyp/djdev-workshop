@@ -47,7 +47,7 @@ DEFAULTS: dict[str, Any] = {
     "daily_format": {
         "group_by_project": True,
         "show_tools": True,
-        "show_files": False,
+        "show_files": True,
         "show_branch": True,
         "project_heading": "### \U0001f916 {project}",
         "entry_format": "**{time}** \u00b7 `{category}` \u00b7 {duration}",
@@ -273,14 +273,34 @@ def _parse_user_text(content: Any) -> str:
     return ""
 
 
+def _tool_call_label(name: str, inputs: dict) -> str:
+    """Format a tool call as 'ToolName(key_param)' for prompt context."""
+    if not inputs:
+        return name
+    # Pick the most informative parameter
+    for key in ("command", "path", "file_path", "pattern", "query", "url", "content"):
+        val = inputs.get(key)
+        if val and isinstance(val, str):
+            # Truncate long values
+            short = val[:60].replace("\n", " ")
+            return f"{name}({short})"
+    # Fallback: first string value
+    for val in inputs.values():
+        if val and isinstance(val, str):
+            short = val[:60].replace("\n", " ")
+            return f"{name}({short})"
+    return name
+
+
 def extract_transcript(transcript_path: str) -> dict[str, Any]:
     """
     Parse JSONL transcript and return structured data.
 
     Returns:
         {
-            "user_messages": [str, ...],   # first 15, 200 chars each
+            "user_messages": [str, ...],   # first 15, full text
             "tools_used": [str, ...],       # unique tool names
+            "tool_calls": [str, ...],       # tool calls with key params, up to 30
             "files_modified": [str, ...],   # from file-history-snapshot
             "start_ts": float | None,
             "end_ts": float | None,
@@ -290,6 +310,7 @@ def extract_transcript(transcript_path: str) -> dict[str, Any]:
     result: dict[str, Any] = {
         "user_messages": [],
         "tools_used": [],
+        "tool_calls": [],
         "files_modified": [],
         "start_ts": None,
         "end_ts": None,
@@ -300,6 +321,7 @@ def extract_transcript(transcript_path: str) -> dict[str, Any]:
         return result
 
     tools_seen: set[str] = set()
+    tool_calls: list[str] = []
     files_seen: set[str] = set()
     user_messages: list[str] = []
     timestamps: list[float] = []
@@ -336,10 +358,10 @@ def extract_transcript(transcript_path: str) -> dict[str, Any]:
                     if text:
                         result["turn_count"] += 1
                         if len(user_messages) < 15:
-                            user_messages.append(text[:200])
+                            user_messages.append(text)
 
                 elif role == "assistant":
-                    # Extract tool uses
+                    # Extract tool uses with inputs
                     if isinstance(content, list):
                         for block in content:
                             if (
@@ -349,6 +371,11 @@ def extract_transcript(transcript_path: str) -> dict[str, Any]:
                                 name = block.get("name", "")
                                 if name:
                                     tools_seen.add(name)
+                                    if len(tool_calls) < 30:
+                                        inputs = block.get("input", {}) or {}
+                                        tool_calls.append(
+                                            _tool_call_label(name, inputs)
+                                        )
 
                 # file-history-snapshot entries
                 if entry.get("type") == "file-history-snapshot":
@@ -362,6 +389,7 @@ def extract_transcript(transcript_path: str) -> dict[str, Any]:
 
     result["user_messages"] = user_messages
     result["tools_used"] = sorted(tools_seen)
+    result["tool_calls"] = tool_calls
     result["files_modified"] = sorted(files_seen)[:20]
 
     if timestamps:
@@ -390,11 +418,17 @@ def format_duration(seconds: float) -> str:
 # ---------------------------------------------------------------------------
 
 PROMPT_TEMPLATE = """You are analyzing a Claude Code session. The daily note may already contain previous entries shown below.
-Based on the messages, provide a summary that complements (not duplicates) existing entries.
+Based on the messages and context, provide a summary that complements (not duplicates) existing entries.
 If this is a resumed session, update the summary to cover ALL work done.
 
 Line 1: Category (one of: feature, bugfix, refactor, research, config, docs, review, other)
 Line 2: Summary in 1-2 sentences describing what was accomplished.{language_instruction}
+
+Session context:
+- Duration: {duration}
+- Turns: {turns}
+- Tools used: {tools}
+- Files modified: {files}
 
 Messages from user during session:
 {messages}{note_context}
@@ -407,6 +441,7 @@ def summarize(
     transcript: dict[str, Any],
     config: dict[str, Any],
     existing_note: str = "",
+    duration_secs: float = 0.0,
 ) -> tuple[str, str]:
     """
     Generate AI summary using claude CLI.
@@ -422,18 +457,32 @@ def summarize(
         return "other", fallback_summary
 
     # Build prompt
-    msgs_text = "\n".join(f"- {m}" for m in messages[:10])
+    msgs_text = "\n".join(f"- {m}" for m in messages)
     note_context = (
-        f"\n\nExisting daily note entries:\n{existing_note[:1000]}"
+        f"\n\nExisting daily note entries:\n{existing_note}"
         if existing_note
         else ""
     )
     language = config.get("language")
     language_instruction = f" Write the summary in {language}." if language else ""
+
+    tool_calls = transcript.get("tool_calls", [])
+    tools_used = transcript.get("tools_used", [])
+    files_modified = transcript.get("files_modified", [])
+    # Use detailed tool_calls if available, otherwise fall back to tool names
+    tools_str = ", ".join(tool_calls) if tool_calls else (", ".join(tools_used) if tools_used else "none")
+    files_str = ", ".join(files_modified) if files_modified else "none"
+    duration_str = format_duration(duration_secs) if duration_secs else "unknown"
+    turn_count = transcript.get("turn_count", 0)
+
     prompt = PROMPT_TEMPLATE.format(
         messages=msgs_text,
         note_context=note_context,
         language_instruction=language_instruction,
+        duration=duration_str,
+        turns=turn_count,
+        tools=tools_str,
+        files=files_str,
     )
 
     # Clean environment — avoid "already running" error
@@ -832,6 +881,16 @@ def get_git_branch(cwd: str) -> str:
     return ""
 
 
+def _print_result(icon: str, parts: list[str], color: str = "") -> None:
+    """Print a single-line result to stdout with optional ANSI color."""
+    use_color = color and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    line = f"{icon} session-digest · " + " · ".join(p for p in parts if p)
+    if use_color:
+        print(f"\033[{color}m{line}\033[0m")
+    else:
+        print(line)
+
+
 def main() -> None:
     """Main entry point. Reads stdin, processes session, writes digest. Always exits 0."""
     try:
@@ -856,7 +915,8 @@ def _run() -> None:
     # 2. Load config
     config = load_config(cwd)
     if config is None:
-        return  # hint already printed
+        _print_result("○", ["not configured — run /digest-config to set up"])
+        return
 
     # 3. Extract transcript
     transcript = extract_transcript(transcript_path)
@@ -868,6 +928,8 @@ def _run() -> None:
             f"[session-digest] Session {session_id[:8]}: {transcript['turn_count']} turns < min_turns={min_turns}, skipping",
             file=sys.stderr,
         )
+        turn_count = transcript["turn_count"]
+        _print_result("○", [f"skipped ({turn_count} turns < min {min_turns})"])
         return
 
     # 5. Determine output file and check for existing session (resume detection)
@@ -903,7 +965,7 @@ def _run() -> None:
             pass
 
     # 8. AI summary
-    category, summary = summarize(transcript, config, existing_note)
+    category, summary = summarize(transcript, config, existing_note, duration_secs)
 
     # 9. Format entry
     project = get_project_name(cwd)
@@ -926,6 +988,12 @@ def _run() -> None:
             f"[session-digest] Updated (resume) {session_id[:8]} in {output_file}",
             file=sys.stderr,
         )
+        str_path = str(output_file).replace(str(Path.home()), "~")
+        _print_result(
+            "↻",
+            [category, format_duration(duration_secs) if duration_secs else "", project, f"→ {str_path} (updated)"],
+            "33",
+        )
         return
 
     if obsidian_enabled:
@@ -942,6 +1010,12 @@ def _run() -> None:
         out = write_plain(config["output_dir"], date_str, project, entry, config)
 
     print(f"[session-digest] Written to {out}", file=sys.stderr)
+    str_path = str(out).replace(str(Path.home()), "~")
+    _print_result(
+        "✓",
+        [category, format_duration(duration_secs) if duration_secs else "", project, f"→ {str_path}"],
+        "32",
+    )
 
 
 if __name__ == "__main__":
