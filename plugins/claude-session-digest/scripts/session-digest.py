@@ -5,7 +5,11 @@ claude-session-digest — SessionEnd hook script
 Reads SessionEnd JSON from stdin, extracts transcript data, generates an AI summary
 (optional), and writes a structured entry to a daily markdown digest.
 
-Config: ~/.config/session-digest/config.json
+Config cascade (first found wins):
+  1. SESSION_DIGEST_CONFIG env var       — explicit override
+  2. {cwd}/.claude/session-digest.local.md  — per-project override
+  3. ~/.claude/session-digest.local.md      — user-level defaults
+
 Docs:   https://github.com/djimontyp/djdev-workshop/tree/main/plugins/claude-session-digest
 """
 
@@ -24,14 +28,6 @@ from typing import Any
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-_config_env = os.environ.get("SESSION_DIGEST_CONFIG")
-CONFIG_PATH = (
-    Path(_config_env)
-    if _config_env
-    else Path.home() / ".config" / "session-digest" / "config.json"
-)
-CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 
 DEFAULTS: dict[str, Any] = {
     "output_dir": "~/daily-summaries",
@@ -76,23 +72,157 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def load_config() -> dict[str, Any] | None:
-    """Load config from CONFIG_PATH. Returns None if config not found (prints hint)."""
-    if not CONFIG_PATH.exists():
+def _parse_frontmatter(text: str) -> dict[str, Any]:
+    """Extract and parse YAML frontmatter from .local.md content.
+
+    Handles flat key: value lines between --- markers.
+    Supported types: strings, integers, floats, booleans (true/false), null.
+    Ignores # comments and empty lines.
+    """
+    result: dict[str, Any] = {}
+
+    match = re.match(r"^---\s*\n(.*?)\n---", text, re.DOTALL)
+    if not match:
+        return result
+
+    for line in match.group(1).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            continue
+
+        key, _, raw = line.partition(":")
+        key = key.strip()
+        raw = raw.strip()
+
+        if not key:
+            continue
+
+        if raw == "" or raw.lower() in ("null", "~"):
+            result[key] = None
+        elif raw.lower() == "true":
+            result[key] = True
+        elif raw.lower() == "false":
+            result[key] = False
+        elif (raw.startswith('"') and raw.endswith('"')) or (
+            raw.startswith("'") and raw.endswith("'")
+        ):
+            result[key] = raw[1:-1]
+        elif re.fullmatch(r"-?\d+", raw):
+            result[key] = int(raw)
+        elif re.fullmatch(r"-?\d+\.\d+", raw):
+            result[key] = float(raw)
+        else:
+            result[key] = raw
+
+    return result
+
+
+def _resolve_config_path(cwd: str) -> Path | None:
+    """Resolve config file path via cascade (first found wins).
+
+    Priority:
+    1. SESSION_DIGEST_CONFIG env var        — explicit override (backward compat)
+    2. {cwd}/.claude/session-digest.local.md — per-project override
+    3. ~/.claude/session-digest.local.md     — user-level defaults
+    """
+    env_path = os.environ.get("SESSION_DIGEST_CONFIG")
+    if env_path:
+        p = Path(env_path)
+        if p.exists():
+            return p
         print(
-            f"[session-digest] No config found at {CONFIG_PATH}.\n"
-            f"  Copy config.example.json to {CONFIG_PATH} and customize.\n"
-            f"  See: https://github.com/djimontyp/djdev-workshop/tree/main/plugins/claude-session-digest",
+            f"[session-digest] SESSION_DIGEST_CONFIG={env_path} not found, falling back to cascade",
+            file=sys.stderr,
+        )
+
+    candidates: list[Path] = []
+    if cwd:
+        candidates.append(Path(cwd) / ".claude" / "session-digest.local.md")
+    candidates.append(Path.home() / ".claude" / "session-digest.local.md")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+def _unflatten_config(flat: dict[str, Any]) -> dict[str, Any]:
+    """Unflatten obsidian_* and daily_format keys into nested dicts."""
+    user_config: dict[str, Any] = {}
+    obsidian_overrides: dict[str, Any] = {}
+    daily_format_overrides: dict[str, Any] = {}
+
+    daily_format_keys = {
+        "group_by_project",
+        "show_tools",
+        "show_files",
+        "show_branch",
+        "project_heading",
+        "entry_format",
+    }
+
+    for key, value in flat.items():
+        if key.startswith("obsidian_"):
+            obsidian_overrides[key[len("obsidian_") :]] = value
+        elif key in daily_format_keys:
+            daily_format_overrides[key] = value
+        else:
+            user_config[key] = value
+
+    if obsidian_overrides:
+        user_config["obsidian"] = obsidian_overrides
+    if daily_format_overrides:
+        user_config["daily_format"] = daily_format_overrides
+
+    return user_config
+
+
+def load_config(cwd: str = "") -> dict[str, Any] | None:
+    """Load config via path cascade. Returns None if not found (prints hint)."""
+    config_path = _resolve_config_path(cwd)
+
+    if config_path is None:
+        user_path = Path.home() / ".claude" / "session-digest.local.md"
+        hints = [f"  Create {user_path} (all projects)"]
+        if cwd:
+            project_path = Path(cwd) / ".claude" / "session-digest.local.md"
+            hints.append(f"  Or {project_path} (this project only)")
+        print(
+            "[session-digest] No config found.\n" + "\n".join(hints) + "\n"
+            "  Template: $(claude plugin path claude-session-digest)/config.example.md",
             file=sys.stderr,
         )
         return None
 
     try:
-        raw = CONFIG_PATH.read_text(encoding="utf-8")
-        user_config = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        print(f"[session-digest] Config parse error: {exc}", file=sys.stderr)
+        raw = config_path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        print(
+            f"[session-digest] Cannot read config {config_path}: {exc}", file=sys.stderr
+        )
         return None
+
+    # Legacy JSON support (SESSION_DIGEST_CONFIG pointing to .json)
+    if config_path.suffix == ".json":
+        try:
+            user_flat = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            print(f"[session-digest] Config parse error: {exc}", file=sys.stderr)
+            return None
+        user_config = user_flat
+    else:
+        # Parse .local.md frontmatter
+        user_flat = _parse_frontmatter(raw)
+        if not user_flat:
+            print(
+                f"[session-digest] No frontmatter found in {config_path}",
+                file=sys.stderr,
+            )
+            return None
+        user_config = _unflatten_config(user_flat)
 
     config = _deep_merge(DEFAULTS, user_config)
 
@@ -105,32 +235,6 @@ def load_config() -> dict[str, Any] | None:
         obsidian["template_path"] = str(Path(obsidian["template_path"]).expanduser())
 
     return config
-
-
-def detect_language(config: dict[str, Any]) -> str:
-    """Detect language: config > Claude settings > 'en'."""
-    # 1. Explicit config setting
-    if config.get("language"):
-        lang = config["language"].lower()
-        if "uk" in lang or "укра" in lang:
-            return "uk"
-        return lang[:2]
-
-    # 2. Claude Code settings
-    try:
-        if CLAUDE_SETTINGS_PATH.exists():
-            settings = json.loads(CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8"))
-            lang_raw = settings.get("language", "")
-            if lang_raw:
-                lang = lang_raw.lower()
-                if "uk" in lang or "укра" in lang:
-                    return "uk"
-                return lang[:2]
-    except Exception:
-        pass
-
-    # 3. Fallback
-    return "en"
 
 
 # ---------------------------------------------------------------------------
@@ -285,33 +389,24 @@ def format_duration(seconds: float) -> str:
 # AI Summarization (Phase 3)
 # ---------------------------------------------------------------------------
 
-PROMPT_TEMPLATE_EN = """You are analyzing a Claude Code session. Based on the messages below, provide:
+PROMPT_TEMPLATE = """You are analyzing a Claude Code session. The daily note may already contain previous entries shown below.
+Based on the messages, provide a summary that complements (not duplicates) existing entries.
+If this is a resumed session, update the summary to cover ALL work done.
 
 Line 1: Category (one of: feature, bugfix, refactor, research, config, docs, review, other)
-Line 2: Summary in 1-2 sentences describing what was accomplished.
+Line 2: Summary in 1-2 sentences describing what was accomplished.{language_instruction}
 
 Messages from user during session:
-{messages}
-
+{messages}{note_context}
 Respond in this exact format:
-Category: <category>
-Summary: <summary>"""
-
-PROMPT_TEMPLATE_UK = """Ти аналізуєш сесію Claude Code. На основі повідомлень нижче надай:
-
-Рядок 1: Категорія (одна з: feature, bugfix, refactor, research, config, docs, review, other)
-Рядок 2: Короткий опис (1-2 речення) що було зроблено.
-
-Повідомлення від користувача під час сесії:
-{messages}
-
-Відповідь строго в такому форматі:
 Category: <category>
 Summary: <summary>"""
 
 
 def summarize(
-    transcript: dict[str, Any], config: dict[str, Any], language: str
+    transcript: dict[str, Any],
+    config: dict[str, Any],
+    existing_note: str = "",
 ) -> tuple[str, str]:
     """
     Generate AI summary using claude CLI.
@@ -328,8 +423,18 @@ def summarize(
 
     # Build prompt
     msgs_text = "\n".join(f"- {m}" for m in messages[:10])
-    template = PROMPT_TEMPLATE_UK if language == "uk" else PROMPT_TEMPLATE_EN
-    prompt = template.format(messages=msgs_text)
+    note_context = (
+        f"\n\nExisting daily note entries:\n{existing_note[:1000]}"
+        if existing_note
+        else ""
+    )
+    language = config.get("language")
+    language_instruction = f" Write the summary in {language}." if language else ""
+    prompt = PROMPT_TEMPLATE.format(
+        messages=msgs_text,
+        note_context=note_context,
+        language_instruction=language_instruction,
+    )
 
     # Clean environment — avoid "already running" error
     env = os.environ.copy()
@@ -396,6 +501,37 @@ def is_duplicate(file_path: Path, session_id: str) -> bool:
         return False
 
 
+def replace_entry(file_path: Path, session_id: str, new_entry: str) -> None:
+    """Replace existing session entry block in file (atomic). Used for resume updates."""
+    if not file_path.exists():
+        return
+    content = file_path.read_text(encoding="utf-8")
+    marker = f"<!-- session:{session_id} -->"
+    start = content.find(marker)
+    if start == -1:
+        return
+
+    # Find end of entry block: next session comment, next heading (##/###), or EOF
+    after_marker = content[start + len(marker) :]
+    candidates: list[int] = []
+
+    next_session = after_marker.find("<!-- session:")
+    if next_session != -1:
+        candidates.append(next_session)
+
+    next_heading = re.search(r"^#{2,3} ", after_marker, re.MULTILINE)
+    if next_heading:
+        candidates.append(next_heading.start())
+
+    if candidates:
+        block_offset = min(candidates)
+        tail = after_marker[block_offset:].lstrip("\n")
+    else:
+        tail = ""
+
+    _atomic_write(file_path, content[:start] + new_entry + "\n\n" + tail)
+
+
 # ---------------------------------------------------------------------------
 # Entry Formatting
 # ---------------------------------------------------------------------------
@@ -425,13 +561,26 @@ def format_entry(
 
     # Entry header
     entry_tmpl = fmt.get("entry_format", DEFAULTS["daily_format"]["entry_format"])
-    header = entry_tmpl.format(
-        time=time_str,
-        category=category,
-        duration=duration_str,
-        tools=len(transcript.get("tools_used", [])),
-        branch=branch,
-    )
+    try:
+        header = entry_tmpl.format(
+            time=time_str,
+            category=category,
+            duration=duration_str,
+            tools=len(transcript.get("tools_used", [])),
+            branch=branch,
+        )
+    except KeyError as e:
+        print(
+            f"[session-digest] Warning: invalid variable {e} in entry_format, using default",
+            file=sys.stderr,
+        )
+        header = DEFAULTS["daily_format"]["entry_format"].format(
+            time=time_str,
+            category=category,
+            duration=duration_str,
+            tools=len(transcript.get("tools_used", [])),
+            branch=branch,
+        )
 
     lines = [
         f"<!-- session:{session_id} -->",
@@ -705,7 +854,7 @@ def _run() -> None:
         return
 
     # 2. Load config
-    config = load_config()
+    config = load_config(cwd)
     if config is None:
         return  # hint already printed
 
@@ -721,10 +870,7 @@ def _run() -> None:
         )
         return
 
-    # 5. Dedup check
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    language = detect_language(config)
-
+    # 5. Determine output file and check for existing session (resume detection)
     obsidian_cfg = config.get("obsidian", {})
     obsidian_enabled = obsidian_cfg.get("enabled", False)
 
@@ -733,31 +879,33 @@ def _run() -> None:
         daily_dir = obsidian_cfg.get("daily_notes_dir", "Daily notes")
         folder_fmt = obsidian_cfg.get("folder_format", "%Y/%m")
         date_fmt = obsidian_cfg.get("date_format", "%Y-%m-%d")
-        try:
-            dt = datetime.strptime(date_str, date_fmt)
-        except ValueError:
-            dt = datetime.now()
+        dt = datetime.now()
+        date_str = dt.strftime(date_fmt)
         folder = dt.strftime(folder_fmt)
         output_file = Path(vault_path) / daily_dir / folder / f"{date_str}.md"
     else:
+        date_str = datetime.now().strftime("%Y-%m-%d")
         output_file = Path(config["output_dir"]) / f"{date_str}.md"
 
-    if is_duplicate(output_file, session_id):
-        print(
-            f"[session-digest] Session {session_id[:8]} already in digest, skipping",
-            file=sys.stderr,
-        )
-        return
+    is_resume = is_duplicate(output_file, session_id)
 
     # 6. Calculate duration
     start_ts = transcript.get("start_ts")
     end_ts = transcript.get("end_ts")
     duration_secs = (end_ts - start_ts) if (start_ts and end_ts) else 0.0
 
-    # 7. AI summary
-    category, summary = summarize(transcript, config, language)
+    # 7. Read existing note for LLM context (helps summarize resumed sessions)
+    existing_note = ""
+    if output_file.exists():
+        try:
+            existing_note = output_file.read_text(encoding="utf-8")
+        except OSError:
+            pass
 
-    # 8. Format entry
+    # 8. AI summary
+    category, summary = summarize(transcript, config, existing_note)
+
+    # 9. Format entry
     project = get_project_name(cwd)
     branch = get_git_branch(cwd)
     entry = format_entry(
@@ -771,7 +919,15 @@ def _run() -> None:
         branch=branch,
     )
 
-    # 9. Write to output
+    # 10. Write to output (update in-place for resume, append for new sessions)
+    if is_resume:
+        replace_entry(output_file, session_id, entry)
+        print(
+            f"[session-digest] Updated (resume) {session_id[:8]} in {output_file}",
+            file=sys.stderr,
+        )
+        return
+
     if obsidian_enabled:
         vault_path = obsidian_cfg.get("vault_path", "")
         if not vault_path:
