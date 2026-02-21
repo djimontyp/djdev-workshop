@@ -1,5 +1,4 @@
 {
-  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "djdev-workshop",
   "description": "Claude Code plugins by djdev",
   "owner": {
@@ -12,7 +11,6 @@
       "description": "Auto-summarize Claude Code sessions into daily markdown digests. Includes daily productivity assistant with optional Obsidian integration.",
       "source": "./plugins/claude-session-digest",
       "category": "productivity",
-      "version": "0.1.0",
       "homepage": "https://github.com/djimontyp/djdev-workshop/tree/main/plugins/claude-session-digest"
     }
   ]

@@ -1,5 +1,4 @@
 {
-  "description": "Summarize Claude Code sessions into daily markdown digests on session end",
   "hooks": {
     "SessionEnd": [
       {

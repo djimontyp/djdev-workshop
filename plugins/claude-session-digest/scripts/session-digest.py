@@ -376,13 +376,25 @@ def extract_transcript(transcript_path: str) -> dict[str, Any]:
                                         tool_calls.append(
                                             _tool_call_label(name, inputs)
                                         )
+                                    # Extract file_path from Write/Edit tools
+                                    if name in ("Write", "Edit", "NotebookEdit"):
+                                        inputs = block.get("input", {}) or {}
+                                        fpath = inputs.get("file_path") or inputs.get("notebook_path") or ""
+                                        if fpath:
+                                            files_seen.add(fpath)
 
                 # file-history-snapshot entries
                 if entry.get("type") == "file-history-snapshot":
+                    # Legacy format: entry.files[]
                     for f in entry.get("files", []):
                         fname = f.get("path") or f.get("filename") or ""
                         if fname:
                             files_seen.add(fname)
+                    # Current format: snapshot.trackedFileBackups (dict keys)
+                    snapshot = entry.get("snapshot", {})
+                    for fpath in snapshot.get("trackedFileBackups", {}):
+                        if fpath:
+                            files_seen.add(fpath)
 
     except OSError as exc:
         print(f"[session-digest] Cannot read transcript: {exc}", file=sys.stderr)
@@ -390,7 +402,19 @@ def extract_transcript(transcript_path: str) -> dict[str, Any]:
     result["user_messages"] = user_messages
     result["tools_used"] = sorted(tools_seen)
     result["tool_calls"] = tool_calls
-    result["files_modified"] = sorted(files_seen)[:20]
+
+    # Normalize file paths: prefer relative/short forms, deduplicate
+    normalized: set[str] = set()
+    for fpath in files_seen:
+        name = Path(fpath).name
+        # Keep the shortest variant per filename
+        existing = {p for p in normalized if Path(p).name == name}
+        if existing:
+            shortest = min(existing | {fpath}, key=len)
+            normalized = (normalized - existing) | {shortest}
+        else:
+            normalized.add(fpath)
+    result["files_modified"] = sorted(normalized)[:20]
 
     if timestamps:
         result["start_ts"] = min(timestamps)
@@ -645,7 +669,9 @@ def format_entry(
         lines.append(f"> *Tools: {tools_list}*")
 
     if fmt.get("show_files") and transcript.get("files_modified"):
-        files_list = ", ".join(f"`{f}`" for f in transcript["files_modified"][:5])
+        home = str(Path.home())
+        short = [f.replace(home, "~") for f in transcript["files_modified"][:5]]
+        files_list = ", ".join(f"`{f}`" for f in short)
         lines.append(f"> *Files: {files_list}*")
 
     return "\n".join(lines)
@@ -886,9 +912,19 @@ def _print_result(icon: str, parts: list[str], color: str = "") -> None:
     use_color = color and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     line = f"{icon} session-digest · " + " · ".join(p for p in parts if p)
     if use_color:
-        print(f"\033[{color}m{line}\033[0m")
+        print(f"\033[{color}m{line}\033[0m", flush=True)
     else:
-        print(line)
+        print(line, flush=True)
+
+
+def _print_progress(message: str) -> None:
+    """Print an immediate progress line to stdout (flushed)."""
+    use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    line = f"⏳ session-digest · {message}"
+    if use_color:
+        print(f"\033[2m{line}\033[0m", flush=True)
+    else:
+        print(line, flush=True)
 
 
 def main() -> None:
@@ -919,6 +955,7 @@ def _run() -> None:
         return
 
     # 3. Extract transcript
+    _print_progress("processing...")
     transcript = extract_transcript(transcript_path)
 
     # 4. min_turns check
