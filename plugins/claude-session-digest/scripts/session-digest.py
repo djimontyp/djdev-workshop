@@ -908,23 +908,33 @@ def get_git_branch(cwd: str) -> str:
 
 
 def _print_result(icon: str, parts: list[str], color: str = "") -> None:
-    """Print a single-line result to stdout with optional ANSI color."""
-    use_color = color and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    """Print result directly to terminal, bypassing hook stdout capture."""
     line = f"{icon} session-digest · " + " · ".join(p for p in parts if p)
-    if use_color:
-        print(f"\033[{color}m{line}\033[0m", flush=True)
-    else:
-        print(line, flush=True)
+    try:
+        with open("/dev/tty", "w") as tty:
+            use_color = tty.isatty() and not os.environ.get("NO_COLOR")
+            if use_color and color:
+                tty.write(f"\033[{color}m{line}\033[0m\n")
+            else:
+                tty.write(line + "\n")
+            tty.flush()
+    except OSError:
+        print(line, file=sys.stderr, flush=True)
 
 
 def _print_progress(message: str) -> None:
-    """Print an immediate progress line to stdout (flushed)."""
-    use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    """Print progress directly to terminal, bypassing hook stdout capture."""
     line = f"⏳ session-digest · {message}"
-    if use_color:
-        print(f"\033[2m{line}\033[0m", flush=True)
-    else:
-        print(line, flush=True)
+    try:
+        with open("/dev/tty", "w") as tty:
+            use_color = tty.isatty() and not os.environ.get("NO_COLOR")
+            if use_color:
+                tty.write(f"\033[2m{line}\033[0m\n")
+            else:
+                tty.write(line + "\n")
+            tty.flush()
+    except OSError:
+        print(line, file=sys.stderr, flush=True)
 
 
 def main() -> None:
