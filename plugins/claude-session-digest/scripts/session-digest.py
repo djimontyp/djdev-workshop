@@ -409,6 +409,7 @@ def format_entry(
     summary: str,
     transcript: dict[str, Any],
     config: dict[str, Any],
+    branch: str = "",
 ) -> str:
     """Format a single session entry block."""
     fmt = config.get("daily_format", DEFAULTS["daily_format"])
@@ -429,7 +430,7 @@ def format_entry(
         category=category,
         duration=duration_str,
         tools=len(transcript.get("tools_used", [])),
-        branch="",
+        branch=branch,
     )
 
     lines = [
@@ -437,6 +438,9 @@ def format_entry(
         header,
         f"> {summary}",
     ]
+
+    if fmt.get("show_branch") and branch:
+        lines.append(f"> *Branch: `{branch}`*")
 
     if fmt.get("show_tools") and transcript.get("tools_used"):
         tools_list = ", ".join(transcript["tools_used"][:8])
@@ -661,6 +665,24 @@ def get_project_name(cwd: str) -> str:
     return Path(cwd).name or "unknown"
 
 
+def get_git_branch(cwd: str) -> str:
+    """Detect current git branch from cwd. Returns empty string on failure."""
+    if not cwd:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "branch", "--show-current"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return ""
+
+
 def main() -> None:
     """Main entry point. Reads stdin, processes session, writes digest. Always exits 0."""
     try:
@@ -737,6 +759,7 @@ def _run() -> None:
 
     # 8. Format entry
     project = get_project_name(cwd)
+    branch = get_git_branch(cwd)
     entry = format_entry(
         session_id=session_id,
         start_ts=start_ts,
@@ -745,6 +768,7 @@ def _run() -> None:
         summary=summary,
         transcript=transcript,
         config=config,
+        branch=branch,
     )
 
     # 9. Write to output
