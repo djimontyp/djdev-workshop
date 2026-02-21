@@ -1,0 +1,17 @@
+{
+  "description": "Summarize Claude Code sessions into daily markdown digests on session end",
+  "hooks": {
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-digest.py\"",
+            "timeout": 55
+          }
+        ]
+      }
+    ]
+  }
+}
