@@ -1,25 +1,767 @@
 #!/usr/bin/env python3
 """
-claude-session-digest — stub (Phase 0)
+claude-session-digest — SessionEnd hook script
 
-Reads SessionEnd JSON from stdin, logs it to stderr, exits 0.
-Full implementation follows in subsequent phases.
+Reads SessionEnd JSON from stdin, extracts transcript data, generates an AI summary
+(optional), and writes a structured entry to a daily markdown digest.
+
+Config: ~/.config/session-digest/config.json
+Docs:   https://github.com/djimontyp/djdev-workshop/tree/main/plugins/claude-session-digest
 """
 
+from __future__ import annotations
+
 import json
+import os
+import re
+import subprocess
 import sys
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_config_env = os.environ.get("SESSION_DIGEST_CONFIG")
+CONFIG_PATH = (
+    Path(_config_env)
+    if _config_env
+    else Path.home() / ".config" / "session-digest" / "config.json"
+)
+CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+
+DEFAULTS: dict[str, Any] = {
+    "output_dir": "~/daily-summaries",
+    "language": None,
+    "model": "haiku",
+    "min_turns": 3,
+    "obsidian": {
+        "enabled": False,
+        "vault_path": "",
+        "daily_notes_dir": "Daily notes",
+        "date_format": "%Y-%m-%d",
+        "folder_format": "%Y/%m",
+        "section_heading": "## Notes",
+        "wikilinks": True,
+        "template_path": "",
+    },
+    "daily_format": {
+        "group_by_project": True,
+        "show_tools": True,
+        "show_files": False,
+        "show_branch": True,
+        "project_heading": "### \U0001f916 {project}",
+        "entry_format": "**{time}** \u00b7 `{category}` \u00b7 {duration}",
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Config System (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Merge override into base recursively, returning a new dict."""
+    result = base.copy()
+    for key, value in override.items():
+        if key.startswith("_"):
+            continue  # skip _doc/_comment fields from example config
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def load_config() -> dict[str, Any] | None:
+    """Load config from CONFIG_PATH. Returns None if config not found (prints hint)."""
+    if not CONFIG_PATH.exists():
+        print(
+            f"[session-digest] No config found at {CONFIG_PATH}.\n"
+            f"  Copy config.example.json to {CONFIG_PATH} and customize.\n"
+            f"  See: https://github.com/djimontyp/djdev-workshop/tree/main/plugins/claude-session-digest",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        raw = CONFIG_PATH.read_text(encoding="utf-8")
+        user_config = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"[session-digest] Config parse error: {exc}", file=sys.stderr)
+        return None
+
+    config = _deep_merge(DEFAULTS, user_config)
+
+    # Expand ~ in paths
+    config["output_dir"] = str(Path(config["output_dir"]).expanduser())
+    obsidian = config["obsidian"]
+    if obsidian.get("vault_path"):
+        obsidian["vault_path"] = str(Path(obsidian["vault_path"]).expanduser())
+    if obsidian.get("template_path"):
+        obsidian["template_path"] = str(Path(obsidian["template_path"]).expanduser())
+
+    return config
+
+
+def detect_language(config: dict[str, Any]) -> str:
+    """Detect language: config > Claude settings > 'en'."""
+    # 1. Explicit config setting
+    if config.get("language"):
+        lang = config["language"].lower()
+        if "uk" in lang or "укра" in lang:
+            return "uk"
+        return lang[:2]
+
+    # 2. Claude Code settings
+    try:
+        if CLAUDE_SETTINGS_PATH.exists():
+            settings = json.loads(CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8"))
+            lang_raw = settings.get("language", "")
+            if lang_raw:
+                lang = lang_raw.lower()
+                if "uk" in lang or "укра" in lang:
+                    return "uk"
+                return lang[:2]
+    except Exception:
+        pass
+
+    # 3. Fallback
+    return "en"
+
+
+# ---------------------------------------------------------------------------
+# Stdin Parsing
+# ---------------------------------------------------------------------------
+
+
+def read_stdin() -> dict[str, Any]:
+    """Read and parse SessionEnd JSON from stdin."""
+    try:
+        raw = sys.stdin.read()
+        return json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Transcript Extraction (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+def _parse_user_text(content: Any) -> str:
+    """Extract text from user message content (string or list of blocks)."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(block.get("text", "").strip())
+                elif block.get("type") == "tool_result":
+                    # Skip tool result blocks in user messages
+                    pass
+        return " ".join(p for p in parts if p)
+    return ""
+
+
+def extract_transcript(transcript_path: str) -> dict[str, Any]:
+    """
+    Parse JSONL transcript and return structured data.
+
+    Returns:
+        {
+            "user_messages": [str, ...],   # first 15, 200 chars each
+            "tools_used": [str, ...],       # unique tool names
+            "files_modified": [str, ...],   # from file-history-snapshot
+            "start_ts": float | None,
+            "end_ts": float | None,
+            "turn_count": int,
+        }
+    """
+    result: dict[str, Any] = {
+        "user_messages": [],
+        "tools_used": [],
+        "files_modified": [],
+        "start_ts": None,
+        "end_ts": None,
+        "turn_count": 0,
+    }
+
+    if not transcript_path or not Path(transcript_path).exists():
+        return result
+
+    tools_seen: set[str] = set()
+    files_seen: set[str] = set()
+    user_messages: list[str] = []
+    timestamps: list[float] = []
+
+    try:
+        path = Path(transcript_path)
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                # Timestamps
+                ts_raw = entry.get("timestamp")
+                if ts_raw:
+                    try:
+                        ts = datetime.fromisoformat(
+                            ts_raw.replace("Z", "+00:00")
+                        ).timestamp()
+                        timestamps.append(ts)
+                    except (ValueError, TypeError):
+                        pass
+
+                msg = entry.get("message", {})
+                role = msg.get("role", "")
+                content = msg.get("content", [])
+
+                if role == "user":
+                    text = _parse_user_text(content)
+                    if text:
+                        result["turn_count"] += 1
+                        if len(user_messages) < 15:
+                            user_messages.append(text[:200])
+
+                elif role == "assistant":
+                    # Extract tool uses
+                    if isinstance(content, list):
+                        for block in content:
+                            if (
+                                isinstance(block, dict)
+                                and block.get("type") == "tool_use"
+                            ):
+                                name = block.get("name", "")
+                                if name:
+                                    tools_seen.add(name)
+
+                # file-history-snapshot entries
+                if entry.get("type") == "file-history-snapshot":
+                    for f in entry.get("files", []):
+                        fname = f.get("path") or f.get("filename") or ""
+                        if fname:
+                            files_seen.add(fname)
+
+    except OSError as exc:
+        print(f"[session-digest] Cannot read transcript: {exc}", file=sys.stderr)
+
+    result["user_messages"] = user_messages
+    result["tools_used"] = sorted(tools_seen)
+    result["files_modified"] = sorted(files_seen)[:20]
+
+    if timestamps:
+        result["start_ts"] = min(timestamps)
+        result["end_ts"] = max(timestamps)
+
+    return result
+
+
+def format_duration(seconds: float) -> str:
+    """Format seconds into human-readable duration."""
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "< 1m"
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    mins = minutes % 60
+    if mins:
+        return f"{hours}h {mins}m"
+    return f"{hours}h"
+
+
+# ---------------------------------------------------------------------------
+# AI Summarization (Phase 3)
+# ---------------------------------------------------------------------------
+
+PROMPT_TEMPLATE_EN = """You are analyzing a Claude Code session. Based on the messages below, provide:
+
+Line 1: Category (one of: feature, bugfix, refactor, research, config, docs, review, other)
+Line 2: Summary in 1-2 sentences describing what was accomplished.
+
+Messages from user during session:
+{messages}
+
+Respond in this exact format:
+Category: <category>
+Summary: <summary>"""
+
+PROMPT_TEMPLATE_UK = """Ти аналізуєш сесію Claude Code. На основі повідомлень нижче надай:
+
+Рядок 1: Категорія (одна з: feature, bugfix, refactor, research, config, docs, review, other)
+Рядок 2: Короткий опис (1-2 речення) що було зроблено.
+
+Повідомлення від користувача під час сесії:
+{messages}
+
+Відповідь строго в такому форматі:
+Category: <category>
+Summary: <summary>"""
+
+
+def summarize(
+    transcript: dict[str, Any], config: dict[str, Any], language: str
+) -> tuple[str, str]:
+    """
+    Generate AI summary using claude CLI.
+
+    Returns: (category, summary_text)
+    Fallback on failure: ("other", first_user_message or "Session")
+    """
+    model = config.get("model")
+    messages = transcript.get("user_messages", [])
+    fallback_summary = messages[0] if messages else "Session"
+
+    if not model or not messages:
+        return "other", fallback_summary
+
+    # Build prompt
+    msgs_text = "\n".join(f"- {m}" for m in messages[:10])
+    template = PROMPT_TEMPLATE_UK if language == "uk" else PROMPT_TEMPLATE_EN
+    prompt = template.format(messages=msgs_text)
+
+    # Clean environment — avoid "already running" error
+    env = os.environ.copy()
+    env.pop("CLAUDECODE", None)
+    env.pop("CLAUDE_CODE", None)
+
+    try:
+        result = subprocess.run(
+            ["claude", "-p", "--model", model],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        output = result.stdout.strip()
+        if not output:
+            return "other", fallback_summary
+
+        # Parse response
+        category = "other"
+        summary = fallback_summary
+        for line in output.splitlines():
+            line = line.strip()
+            if line.lower().startswith("category:"):
+                raw_cat = line.split(":", 1)[1].strip().lower()
+                valid = {
+                    "feature",
+                    "bugfix",
+                    "refactor",
+                    "research",
+                    "config",
+                    "docs",
+                    "review",
+                    "other",
+                }
+                category = raw_cat if raw_cat in valid else "other"
+            elif line.lower().startswith("summary:"):
+                summary = line.split(":", 1)[1].strip()
+
+        return category, summary
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        print(
+            f"[session-digest] AI summary failed ({exc}), using fallback",
+            file=sys.stderr,
+        )
+        return "other", fallback_summary
+
+
+# ---------------------------------------------------------------------------
+# Dedup Check
+# ---------------------------------------------------------------------------
+
+
+def is_duplicate(file_path: Path, session_id: str) -> bool:
+    """Check if session_id HTML comment already exists in file."""
+    if not file_path.exists():
+        return False
+    try:
+        content = file_path.read_text(encoding="utf-8")
+        return f"<!-- session:{session_id} -->" in content
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Entry Formatting
+# ---------------------------------------------------------------------------
+
+
+def format_entry(
+    session_id: str,
+    start_ts: float | None,
+    duration_secs: float,
+    category: str,
+    summary: str,
+    transcript: dict[str, Any],
+    config: dict[str, Any],
+) -> str:
+    """Format a single session entry block."""
+    fmt = config.get("daily_format", DEFAULTS["daily_format"])
+
+    # Time
+    if start_ts:
+        dt = datetime.fromtimestamp(start_ts, tz=UTC).astimezone()
+        time_str = dt.strftime("%H:%M")
+    else:
+        time_str = datetime.now().strftime("%H:%M")
+
+    duration_str = format_duration(duration_secs)
+
+    # Entry header
+    entry_tmpl = fmt.get("entry_format", DEFAULTS["daily_format"]["entry_format"])
+    header = entry_tmpl.format(
+        time=time_str,
+        category=category,
+        duration=duration_str,
+        tools=len(transcript.get("tools_used", [])),
+        branch="",
+    )
+
+    lines = [
+        f"<!-- session:{session_id} -->",
+        header,
+        f"> {summary}",
+    ]
+
+    if fmt.get("show_tools") and transcript.get("tools_used"):
+        tools_list = ", ".join(transcript["tools_used"][:8])
+        lines.append(f"> *Tools: {tools_list}*")
+
+    if fmt.get("show_files") and transcript.get("files_modified"):
+        files_list = ", ".join(f"`{f}`" for f in transcript["files_modified"][:5])
+        lines.append(f"> *Files: {files_list}*")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Plain Writer (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+def _atomic_write(file_path: Path, content: str) -> None:
+    """Write content atomically using tmp file + os.replace."""
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=file_path.parent,
+        delete=False,
+        suffix=".tmp",
+    ) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+    os.replace(tmp_path, file_path)
+
+
+def _find_or_create_project_section(
+    content: str,
+    project: str,
+    project_heading_tmpl: str,
+    wikilinks: bool = False,
+) -> tuple[str, int]:
+    """
+    Find or create project heading in content.
+
+    Returns: (updated_content, insert_position_after_heading)
+    """
+    project_display = f"[[{project}]]" if wikilinks else project
+    heading = project_heading_tmpl.format(project=project_display)
+
+    # Look for existing heading (both wikilink and plain variants)
+    patterns = [
+        re.escape(heading),
+        re.escape(project_heading_tmpl.format(project=f"[[{project}]]")),
+        re.escape(project_heading_tmpl.format(project=project)),
+    ]
+    for pat in patterns:
+        match = re.search(f"^{pat}$", content, re.MULTILINE)
+        if match:
+            # Found — find insertion point (after heading + possible blank line, before next ### or ##)
+            pos = match.end()
+            # Skip blank lines after heading
+            while pos < len(content) and content[pos] in ("\n", "\r"):
+                pos += 1
+            # Find the end of this project's section (next ### or ## heading)
+            next_heading = re.search(r"^#{2,3} ", content[pos:], re.MULTILINE)
+            if next_heading:
+                insert_at = pos + next_heading.start()
+            else:
+                insert_at = len(content)
+            return content, insert_at
+
+    # Not found — append project heading at end of content
+    separator = "\n" if content.endswith("\n") else "\n\n"
+    content = content + separator + heading + "\n\n"
+    return content, len(content)
+
+
+def write_plain(
+    output_dir: str,
+    date_str: str,
+    project: str,
+    entry: str,
+    config: dict[str, Any],
+) -> Path:
+    """Write entry to plain markdown daily file."""
+    file_path = Path(output_dir) / f"{date_str}.md"
+    fmt = config.get("daily_format", DEFAULTS["daily_format"])
+    project_heading_tmpl = fmt.get(
+        "project_heading", DEFAULTS["daily_format"]["project_heading"]
+    )
+    group_by_project = fmt.get("group_by_project", True)
+
+    if not file_path.exists():
+        content = f"# Session Digest \u2014 {date_str}\n\n"
+    else:
+        content = file_path.read_text(encoding="utf-8")
+
+    if group_by_project:
+        content, insert_at = _find_or_create_project_section(
+            content, project, project_heading_tmpl, wikilinks=False
+        )
+        # Insert entry at position
+        content = content[:insert_at] + entry + "\n\n" + content[insert_at:]
+    else:
+        if not content.endswith("\n"):
+            content += "\n"
+        content += "\n" + entry + "\n"
+
+    _atomic_write(file_path, content)
+    return file_path
+
+
+# ---------------------------------------------------------------------------
+# Obsidian Writer (Phase 5)
+# ---------------------------------------------------------------------------
+
+OBSIDIAN_FRONTMATTER_TEMPLATE = """---
+Date: {date}
+tags:
+  - daily
+---
+
+"""
+
+
+def _read_or_create_obsidian_note(
+    note_path: Path,
+    date_str: str,
+    section_heading: str,
+    template_path: str,
+) -> str:
+    """Read existing note or create new one with frontmatter."""
+    if note_path.exists():
+        return note_path.read_text(encoding="utf-8")
+
+    # Try user template
+    if template_path and Path(template_path).exists():
+        tmpl = Path(template_path).read_text(encoding="utf-8")
+        return tmpl.replace("{{date}}", date_str).replace("{date}", date_str)
+
+    # Built-in frontmatter
+    content = OBSIDIAN_FRONTMATTER_TEMPLATE.format(date=date_str)
+    content += section_heading + "\n\n"
+    return content
+
+
+def write_obsidian(
+    vault_path: str,
+    date_str: str,
+    project: str,
+    entry: str,
+    config: dict[str, Any],
+) -> Path:
+    """Write entry into Obsidian daily note under the configured section."""
+    obs = config["obsidian"]
+    daily_dir = obs.get("daily_notes_dir", "Daily notes")
+    folder_fmt = obs.get("folder_format", "%Y/%m")
+    date_fmt = obs.get("date_format", "%Y-%m-%d")
+    section_heading = obs.get("section_heading", "## Notes")
+    wikilinks = obs.get("wikilinks", True)
+    template_path = obs.get("template_path", "")
+
+    # Build note path
+    try:
+        dt = datetime.strptime(date_str, date_fmt)
+    except ValueError:
+        dt = datetime.now()
+
+    folder = dt.strftime(folder_fmt)
+    note_filename = f"{date_str}.md"
+    note_path = Path(vault_path) / daily_dir / folder / note_filename
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fmt = config.get("daily_format", DEFAULTS["daily_format"])
+    project_heading_tmpl = fmt.get(
+        "project_heading", DEFAULTS["daily_format"]["project_heading"]
+    )
+
+    content = _read_or_create_obsidian_note(
+        note_path, date_str, section_heading, template_path
+    )
+
+    # Find section heading
+    section_match = re.search(f"^{re.escape(section_heading)}$", content, re.MULTILINE)
+    if not section_match:
+        # Append section at end
+        content = content.rstrip() + f"\n\n{section_heading}\n\n"
+        section_match = re.search(
+            f"^{re.escape(section_heading)}$", content, re.MULTILINE
+        )
+
+    # Work within the section
+    section_start = section_match.end()
+
+    # Find end of section (next ## heading)
+    next_section = re.search(r"^## ", content[section_start:], re.MULTILINE)
+    section_end = section_start + next_section.start() if next_section else len(content)
+
+    section_content = content[section_start:section_end]
+
+    # Find or create project sub-heading within section
+    section_content, insert_at = _find_or_create_project_section(
+        section_content, project, project_heading_tmpl, wikilinks=wikilinks
+    )
+
+    # Insert entry
+    section_content = (
+        section_content[:insert_at] + entry + "\n\n" + section_content[insert_at:]
+    )
+
+    content = content[:section_start] + section_content + content[section_end:]
+    _atomic_write(note_path, content)
+    return note_path
+
+
+# ---------------------------------------------------------------------------
+# Main Orchestration (Phase 6)
+# ---------------------------------------------------------------------------
+
+
+def get_project_name(cwd: str) -> str:
+    """Extract project name from working directory path."""
+    if not cwd:
+        return "unknown"
+    return Path(cwd).name or "unknown"
 
 
 def main() -> None:
-    raw = sys.stdin.read()
+    """Main entry point. Reads stdin, processes session, writes digest. Always exits 0."""
     try:
-        data = json.loads(raw) if raw.strip() else {}
-    except json.JSONDecodeError:
-        data = {}
-
-    session_id = data.get("session_id", "unknown")
-    print(f"[session-digest] stub — session_id={session_id}", file=sys.stderr)
+        _run()
+    except Exception as exc:
+        print(f"[session-digest] Unexpected error: {exc}", file=sys.stderr)
     sys.exit(0)
+
+
+def _run() -> None:
+    """Core processing. May raise — caller handles."""
+    # 1. Parse stdin
+    data = read_stdin()
+    session_id = data.get("session_id", "")
+    transcript_path = data.get("transcript_path", "")
+    cwd = data.get("cwd", "")
+
+    if not session_id:
+        print("[session-digest] No session_id in stdin, skipping", file=sys.stderr)
+        return
+
+    # 2. Load config
+    config = load_config()
+    if config is None:
+        return  # hint already printed
+
+    # 3. Extract transcript
+    transcript = extract_transcript(transcript_path)
+
+    # 4. min_turns check
+    min_turns = config.get("min_turns", 3)
+    if transcript["turn_count"] < min_turns:
+        print(
+            f"[session-digest] Session {session_id[:8]}: {transcript['turn_count']} turns < min_turns={min_turns}, skipping",
+            file=sys.stderr,
+        )
+        return
+
+    # 5. Dedup check
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    language = detect_language(config)
+
+    obsidian_cfg = config.get("obsidian", {})
+    obsidian_enabled = obsidian_cfg.get("enabled", False)
+
+    if obsidian_enabled:
+        vault_path = obsidian_cfg.get("vault_path", "")
+        daily_dir = obsidian_cfg.get("daily_notes_dir", "Daily notes")
+        folder_fmt = obsidian_cfg.get("folder_format", "%Y/%m")
+        date_fmt = obsidian_cfg.get("date_format", "%Y-%m-%d")
+        try:
+            dt = datetime.strptime(date_str, date_fmt)
+        except ValueError:
+            dt = datetime.now()
+        folder = dt.strftime(folder_fmt)
+        output_file = Path(vault_path) / daily_dir / folder / f"{date_str}.md"
+    else:
+        output_file = Path(config["output_dir"]) / f"{date_str}.md"
+
+    if is_duplicate(output_file, session_id):
+        print(
+            f"[session-digest] Session {session_id[:8]} already in digest, skipping",
+            file=sys.stderr,
+        )
+        return
+
+    # 6. Calculate duration
+    start_ts = transcript.get("start_ts")
+    end_ts = transcript.get("end_ts")
+    duration_secs = (end_ts - start_ts) if (start_ts and end_ts) else 0.0
+
+    # 7. AI summary
+    category, summary = summarize(transcript, config, language)
+
+    # 8. Format entry
+    project = get_project_name(cwd)
+    entry = format_entry(
+        session_id=session_id,
+        start_ts=start_ts,
+        duration_secs=duration_secs,
+        category=category,
+        summary=summary,
+        transcript=transcript,
+        config=config,
+    )
+
+    # 9. Write to output
+    if obsidian_enabled:
+        vault_path = obsidian_cfg.get("vault_path", "")
+        if not vault_path:
+            print(
+                "[session-digest] obsidian.enabled=true but vault_path is empty, falling back to plain mode",
+                file=sys.stderr,
+            )
+            out = write_plain(config["output_dir"], date_str, project, entry, config)
+        else:
+            out = write_obsidian(vault_path, date_str, project, entry, config)
+    else:
+        out = write_plain(config["output_dir"], date_str, project, entry, config)
+
+    print(f"[session-digest] Written to {out}", file=sys.stderr)
 
 
 if __name__ == "__main__":
