@@ -1,3 +1,7 @@
+---
+description: Show and validate the current claude-session-digest configuration
+---
+
 # /digest-config
 
 Show and validate the current claude-session-digest configuration.
