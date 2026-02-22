@@ -1,6 +1,6 @@
 {
   "name": "claude-session-digest",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Auto-summarize Claude Code sessions into daily markdown digests. Includes daily productivity assistant with optional Obsidian integration.",
   "author": {
     "name": "djimontyp",

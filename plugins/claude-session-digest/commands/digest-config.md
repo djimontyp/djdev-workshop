@@ -30,9 +30,10 @@ Config file: ~/.claude/session-digest.local.md
 
 Core settings:
   output_dir:  ~/Documents/daily-summaries
-  model:       haiku  (AI summaries enabled)
+  model:       sonnet  (AI summaries enabled)
   language:    null
   min_turns:   3
+  quiet:       false
 
 Obsidian:
   enabled:        false  (plain mode — writing to output_dir)
@@ -53,11 +54,9 @@ Obsidian:
 
 Format:
   group_by_project: true
-  show_tools:       true
-  show_files:       false
+  show_files:       true
   show_branch:      true
   project_heading:  "### 🤖 {project}"
-  entry_format:     "**{time}** · `{category}` · {duration}"
 ```
 
 If no config file is found at any location:

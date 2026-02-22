@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session-digest.py\"",
-            "timeout": 55
+            "timeout": 75
           }
         ]
       }

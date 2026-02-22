@@ -2,28 +2,7 @@
 
 > Auto-summarize Claude Code sessions into daily markdown digests.
 
-Automatically captures what you worked on, summarizes it with AI (Haiku), and writes structured daily notes — either as plain markdown files or into your Obsidian vault.
-
-## ⚠️ API Usage Warning
-
-**This plugin makes an API call after EVERY Claude Code session.**
-
-When a session ends, the script calls `claude -p --model haiku` to generate a summary. This means:
-
-- **Each session = 1 additional API request** to Haiku
-- On Pro/Max subscription, Haiku has a separate quota — usually free
-- On API billing these are **real costs** per call
-- Dozens of sessions per day = dozens of extra requests
-
-**To disable AI summarization** (offline mode, no API calls):
-
-```yaml
-model: null
-```
-
-This uses the first user message as the session description instead. Works completely offline.
-
----
+Automatically captures what you worked on, generates a structured AI summary (Sonnet), and writes daily notes — either as plain markdown files or into your Obsidian vault with collapsible callout blocks.
 
 ## How It Works
 
@@ -37,8 +16,8 @@ flowchart TD
     E -->|Yes| G{session_id exists in file?}
     G -->|Yes — resume| H[Read existing note for context]
     G -->|No — new| H
-    H --> I[AI summarize with note context]
-    I --> J[Format entry]
+    H --> I[AI summarize — structured body]
+    I --> J[Format callout/blockquote entry]
     G -->|Yes| K[Replace existing entry]
     G -->|No| L[Append new entry]
     J --> K
@@ -57,7 +36,13 @@ flowchart TD
 claude plugin install djimontyp/djdev-workshop/claude-session-digest
 ```
 
-### 2. Create your config
+### 2. Run the setup wizard
+
+```
+/digest-init
+```
+
+Or create your config manually:
 
 ```bash
 cp "$(claude plugin path claude-session-digest)/config.example.md" ~/.claude/session-digest.local.md
@@ -68,7 +53,7 @@ Edit `~/.claude/session-digest.local.md` and set your `output_dir`:
 ```yaml
 ---
 output_dir: ~/Documents/daily-summaries
-model: haiku
+model: sonnet
 min_turns: 3
 ---
 ```
@@ -103,12 +88,13 @@ Config uses the `.claude/session-digest.local.md` format — YAML frontmatter in
 |-----|---------|-------------|
 | `output_dir` | `~/daily-summaries` | Directory for daily `.md` files |
 | `language` | `null` | Summary language (e.g. `uk`, `French`, `Українська`). `null` = no instruction, LLM defaults to English |
-| `model` | `"haiku"` | AI model for summaries. `null` = offline mode (no API calls). See model options below |
+| `model` | `"sonnet"` | AI model for summaries. `null` = offline mode (no API calls). See model options below |
 | `min_turns` | `3` | Skip sessions shorter than N user messages |
+| `quiet` | `false` | Suppress progress output, show only result path |
 
 ### Model Options
 
-`"haiku"` · `"sonnet"` · `"opus"` · `null` (offline — no API calls)
+`"sonnet"` (default) · `"haiku"` · `"opus"` · `null` (offline — no API calls)
 
 ### Obsidian Integration
 
@@ -130,72 +116,66 @@ When `obsidian_enabled: true`, sessions are written into your Obsidian vault dai
 | Key | Default | Description |
 |-----|---------|-------------|
 | `group_by_project` | `true` | Group entries under project headings |
-| `show_tools` | `true` | Show tools used in session |
-| `show_files` | `false` | Show modified files list |
+| `show_files` | `true` | Show modified files list |
 | `show_branch` | `true` | Show git branch |
+| `show_worktree` | `true` | Show git worktree path |
 | `project_heading` | `"### 🤖 {project}"` | Template for project heading. `{project}` = dir name |
-| `entry_format` | `"**{time}** · \`{category}\` · {duration}"` | Template for entry header. Vars: `{time}`, `{category}`, `{duration}`, `{tools}` (tool count), `{branch}` |
 
 ---
 
 ## Output Format
 
-### Plain Mode
-
-```markdown
-# Session Digest — 2026-02-21
-
-### 🤖 my-project
-
-<!-- session:abc123 -->
-**09:15** · `feature` · 45m
-> Implemented Telegram message parsing. Added extraction pipeline.
-
-<!-- session:xyz789 -->
-**20:00** · `refactor` · 1h 10m
-> Refactored LoginPresenter. Updated CSS tokens.
-```
-
-### Obsidian Mode (with wikilinks)
+### Obsidian Mode (callout blocks)
 
 ```markdown
 ### 🤖 [[my-project]]
 
 <!-- session:abc123 -->
-**09:15** · `feature` · 45m
-> Implemented Telegram message parsing.
+<!-- title:Implemented auth flow for login page -->
+> [!bot]- **09:15** feature · 45m
+> - Implemented JWT authentication in `auth.py`
+> - Added login/logout endpoints
+>
+> **Key decisions:** chose JWT over sessions
+>
+> `claude --resume abc123-def4-...`
+> *Branch: `main` · Files: `auth.py`, `routes.py`*
 ```
+
+### Plain Mode (blockquote body)
+
+```markdown
+### 🤖 my-project
+
+<!-- session:abc123 -->
+<!-- title:Implemented auth flow for login page -->
+**09:15** feature · 45m
+
+> - Implemented JWT authentication in `auth.py`
+> - Added login/logout endpoints
+>
+> **Key decisions:** chose JWT over sessions
+>
+> `claude --resume abc123-def4-...`
+> *Branch: `main` · Files: `auth.py`, `routes.py`*
+```
+
+Each entry includes:
+- **Structured summary** — bullet points of what was done, key decisions, problems, TODOs
+- **Resume command** — `claude --resume {session_id}` to continue where you left off
+- **Metadata** — branch, modified files
 
 ---
 
 ## Commands
 
+### `/digest-init`
+
+Interactive setup wizard. Guides you through configuring output mode, path, language, and model.
+
 ### `/digest-config`
 
-Shows your current configuration and resolved config path:
-
-```
-claude-session-digest configuration
-─────────────────────────────────────
-Config file: ~/.claude/session-digest.local.md
-
-Core settings:
-  output_dir:  ~/Documents/daily-summaries
-  model:       haiku
-  language:    null
-  min_turns:   3
-
-Obsidian:
-  enabled:     false  (plain mode — writing to output_dir)
-
-Format:
-  group_by_project: true
-  show_tools:       true
-  show_files:       false
-  show_branch:      true
-  project_heading:  "### 🤖 {project}"
-  entry_format:     "**{time}** · `{category}` · {duration}"
-```
+Shows your current configuration and resolved config path.
 
 ---
 
@@ -209,6 +189,26 @@ This plugin includes a `daily-assistant` agent that knows about your Claude sess
 - **Notes** — quick notes with context from your vault
 
 The agent reads from `~/.claude/session-digest.local.md` — no hardcoded paths.
+
+---
+
+## API Usage
+
+**This plugin makes an API call after EVERY Claude Code session** (when `model` is not `null`).
+
+When a session ends, the script calls `claude -p --model sonnet` to generate a summary. This means:
+
+- **Each session = 1 additional API request** to Sonnet
+- On Pro/Max subscription — usually within quota
+- On API billing these are **real costs** per call
+
+**To disable AI summarization** (offline mode, no API calls):
+
+```yaml
+model: null
+```
+
+This uses the first user message as the session title instead.
 
 ---
 
@@ -231,14 +231,9 @@ echo "{\"session_id\":\"test\",\"transcript_path\":\"$TRANSCRIPT\",\"cwd\":\"$(p
 
 Set `model: null` to use offline mode (first user message as description).
 
-**Migrating from old config?**
+**Too much terminal output?**
 
-If you had `~/.config/session-digest/config.json`, copy your settings to the new format:
-
-```bash
-cp "$(claude plugin path claude-session-digest)/config.example.md" ~/.claude/session-digest.local.md
-# Then edit ~/.claude/session-digest.local.md with your previous settings
-```
+Set `quiet: true` to suppress progress messages.
 
 ---
 

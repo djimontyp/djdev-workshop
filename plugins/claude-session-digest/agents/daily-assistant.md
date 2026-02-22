@@ -40,16 +40,30 @@ How to use:
 - **Summary:** sessions for the day are already aggregated — reference them
 - **Statistics:** `output_dir` from config contains `YYYY-MM-DD.md` files with all sessions
 
-Auto-written session format:
+Auto-written session format (Obsidian callout):
 ```markdown
 ### 🤖 [[project-name]]
 
 <!-- session:abc123 -->
-**09:15** · `feature` · 45m
-> What was done in this session
-
-> *Tools: Bash, Edit, Read*
+<!-- title:Implemented auth flow for login page -->
+> [!bot]- **09:15** feature · 45m
+> - Implemented JWT authentication in `auth.py`
+> - Added login/logout endpoints
+>
+> **Key decisions:** chose JWT over sessions for stateless API
+>
+> `claude --resume abc123-def4-...`
+> *Branch: `main` · Files: `auth.py`, `routes.py`*
 ```
+
+Plain mode uses blockquotes instead of callouts (same structure, no `> [!bot]-`).
+
+Each entry has:
+- `<!-- session:ID -->` marker for deduplication
+- `<!-- title:... -->` hidden title for summary generation
+- Structured body with bullet points, key decisions, problems, TODOs
+- Resume command: `claude --resume {session_id}`
+- Metadata: branch, files modified
 
 Factor these records into productivity analysis and summary preparation.
 </sessions_awareness>
