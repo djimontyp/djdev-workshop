@@ -314,6 +314,38 @@ def _tool_call_label(name: str, inputs: dict) -> str:
     return name
 
 
+def count_turns_fast(transcript_path: str) -> int:
+    """Quick turn count without full transcript extraction.
+
+    Scans JSONL for user messages only, skipping tool call / file / timestamp
+    extraction.  Used for early min_turns gating so we can skip expensive
+    parsing for very short sessions.
+    """
+    if not transcript_path or not Path(transcript_path).exists():
+        return 0
+    count = 0
+    try:
+        with Path(transcript_path).open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                # Quick string pre-filter: skip lines that can't contain a user message
+                if '"user"' not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    msg = entry.get("message", {})
+                    if msg.get("role") == "user":
+                        if _parse_user_text(msg.get("content", [])):
+                            count += 1
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+    except OSError:
+        pass
+    return count
+
+
 def extract_transcript(transcript_path: str) -> dict[str, Any]:
     """
     Parse JSONL transcript and return structured data.
@@ -1237,20 +1269,20 @@ def _run() -> None:
         _print_result("○", ["not configured — run /digest-config to set up"])
         return
 
-    # 3. Extract transcript
-    _print_progress("processing...")
-    transcript = extract_transcript(transcript_path)
-
-    # 4. min_turns check
+    # 3. Quick min_turns gate (avoids expensive full transcript parsing)
     min_turns = config.get("min_turns", 3)
-    if transcript["turn_count"] < min_turns:
+    turn_count = count_turns_fast(transcript_path)
+    if turn_count < min_turns:
         print(
-            f"[session-digest] Session {session_id[:8]}: {transcript['turn_count']} turns < min_turns={min_turns}, skipping",
+            f"[session-digest] Session {session_id[:8]}: {turn_count} turns < min_turns={min_turns}, skipping",
             file=sys.stderr,
         )
-        turn_count = transcript["turn_count"]
         _print_result("○", [f"skipped ({turn_count} turns < min {min_turns})"])
         return
+
+    # 4. Extract transcript (full parsing)
+    _print_progress("processing...")
+    transcript = extract_transcript(transcript_path)
 
     # 5. Determine output file and check for existing session (resume detection)
     obsidian_cfg = config.get("obsidian", {})
