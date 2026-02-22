@@ -17,9 +17,14 @@ obsidian_template_path: ""
 
 # Entry format
 group_by_project: true
-show_tools: true
-show_files: false
+show_tools: false
+show_files: true
 show_branch: true
+show_worktree: true
+show_tags: true
+daily_summary: true
+summary_heading: "### Done"
+min_duration: 0
 project_heading: "### 🤖 {project}"
-entry_format: "**{time}** · `{category}` · {duration}"
+entry_format: "**{time}** {category} · {duration}"
 ---

@@ -10,6 +10,18 @@ Config cascade (first found wins):
   2. {cwd}/.claude/session-digest.local.md  — per-project override
   3. ~/.claude/session-digest.local.md      — user-level defaults
 
+Two output modes:
+  - Plain mode (obsidian.enabled=false): clean markdown, compact blockquote metadata
+  - Obsidian mode (obsidian.enabled=true): footnotes, hierarchical tags, wikilinks, summary
+
+Obsidian Syntax Reference:
+  - Footnotes: [^sN] / [^sN]: text — hover preview, rendered at page bottom
+  - Hierarchical tags: #session/config — searchable, Tag pane, nested hierarchy
+  - Wikilinks: [[project]] — clickable link to project note
+  - HTML comments: <!-- --> — invisible in reading view, used for session markers
+  - Frontmatter: YAML between --- markers, tags: plural, aliases: plural
+  - NOT used: callouts, dataview inline, block refs, embeds (not needed for digest)
+
 Docs:   https://github.com/djimontyp/djdev-workshop/tree/main/plugins/claude-session-digest
 """
 
@@ -46,11 +58,16 @@ DEFAULTS: dict[str, Any] = {
     },
     "daily_format": {
         "group_by_project": True,
-        "show_tools": True,
+        "show_tools": False,
         "show_files": True,
         "show_branch": True,
+        "show_worktree": True,
+        "show_tags": True,
+        "daily_summary": True,
+        "summary_heading": "### Done",
+        "min_duration": 0,
         "project_heading": "### \U0001f916 {project}",
-        "entry_format": "**{time}** \u00b7 `{category}` \u00b7 {duration}",
+        "entry_format": "**{time}** {category} \u00b7 {duration}",
     },
 }
 
@@ -160,6 +177,11 @@ def _unflatten_config(flat: dict[str, Any]) -> dict[str, Any]:
         "show_tools",
         "show_files",
         "show_branch",
+        "show_worktree",
+        "show_tags",
+        "daily_summary",
+        "summary_heading",
+        "min_duration",
         "project_heading",
         "entry_format",
     }
@@ -574,7 +596,12 @@ def is_duplicate(file_path: Path, session_id: str) -> bool:
         return False
 
 
-def replace_entry(file_path: Path, session_id: str, new_entry: str) -> None:
+def replace_entry(
+    file_path: Path,
+    session_id: str,
+    new_entry: dict[str, str],
+    config: dict[str, Any] | None = None,
+) -> None:
     """Replace existing session entry block in file (atomic). Used for resume updates."""
     if not file_path.exists():
         return
@@ -584,7 +611,8 @@ def replace_entry(file_path: Path, session_id: str, new_entry: str) -> None:
     if start == -1:
         return
 
-    # Find end of entry block: next session comment, next heading (##/###), or EOF
+    # Find end of entry block: next session comment, next heading (##/###),
+    # or footnote block [^sN]:
     after_marker = content[start + len(marker) :]
     candidates: list[int] = []
 
@@ -596,13 +624,65 @@ def replace_entry(file_path: Path, session_id: str, new_entry: str) -> None:
     if next_heading:
         candidates.append(next_heading.start())
 
+    # Stop before footnotes block
+    next_footnote = re.search(r"^\[\^s\d+\]:", after_marker, re.MULTILINE)
+    if next_footnote:
+        candidates.append(next_footnote.start())
+
     if candidates:
         block_offset = min(candidates)
         tail = after_marker[block_offset:].lstrip("\n")
     else:
         tail = ""
 
-    _atomic_write(file_path, content[:start] + new_entry + "\n\n" + tail)
+    entry_block = new_entry["entry_block"]
+
+    # Extract old [^sN] ref from the old inline to find and replace old footnote
+    old_inline = content[start : start + len(marker) + (min(candidates) if candidates else len(after_marker))]
+    old_fn_match = re.search(r"\[\^s(\d+)\]", old_inline)
+    if old_fn_match:
+        old_fn_id = old_fn_match.group(1)
+        # Remove old footnote definition
+        content_before = content[:start]
+        content_after = tail
+        full_rebuild = content_before + entry_block + "\n\n" + content_after
+        # Replace old footnote line
+        old_fn_pattern = rf"^\[\^s{re.escape(old_fn_id)}\]:.*$\n?"
+        full_rebuild = re.sub(old_fn_pattern, "", full_rebuild, flags=re.MULTILINE)
+        # Insert new footnote if present
+        if new_entry.get("footnote"):
+            # Find section end for footnote insertion
+            obs_section = re.search(r"^## ", full_rebuild[start:], re.MULTILINE)
+            sec_end = start + obs_section.start() if obs_section else len(full_rebuild)
+            full_rebuild = _manage_footnotes(full_rebuild, new_entry["footnote"], sec_end)
+        content = full_rebuild
+    else:
+        content = content[:start] + entry_block + "\n\n" + tail
+        # Add new footnote if present
+        if new_entry.get("footnote"):
+            obs_section = re.search(r"^## ", content[start:], re.MULTILINE)
+            sec_end = start + obs_section.start() if obs_section else len(content)
+            content = _manage_footnotes(content, new_entry["footnote"], sec_end)
+
+    # Regenerate summary if Obsidian mode
+    if config:
+        fmt = config.get("daily_format", {})
+        obs_cfg = config.get("obsidian", {})
+        if obs_cfg.get("enabled") and fmt.get("daily_summary"):
+            section_heading = obs_cfg.get("section_heading", "## Notes")
+            summary_heading = fmt.get("summary_heading", "### Що зроблено")
+            sec_match = re.search(
+                f"^{re.escape(section_heading)}$", content, re.MULTILINE
+            )
+            if sec_match:
+                sec_start = sec_match.end()
+                next_sec = re.search(r"^## ", content[sec_start:], re.MULTILINE)
+                sec_end = sec_start + next_sec.start() if next_sec else len(content)
+                sec_content = content[sec_start:sec_end]
+                new_sec = _regenerate_summary(sec_content, summary_heading)
+                content = content[:sec_start] + new_sec + content[sec_end:]
+
+    _atomic_write(file_path, content)
 
 
 # ---------------------------------------------------------------------------
@@ -619,8 +699,15 @@ def format_entry(
     transcript: dict[str, Any],
     config: dict[str, Any],
     branch: str = "",
-) -> str:
-    """Format a single session entry block."""
+    worktree: str = "",
+    footnote_id: int = 0,
+    obsidian_mode: bool = False,
+) -> dict[str, str]:
+    """Format a single session entry.
+
+    Returns dict with keys: marker, inline, footnote, meta_line,
+    summary_bullet, entry_block.
+    """
     fmt = config.get("daily_format", DEFAULTS["daily_format"])
 
     # Time
@@ -632,7 +719,7 @@ def format_entry(
 
     duration_str = format_duration(duration_secs)
 
-    # Entry header
+    # Entry header (inline part before summary)
     entry_tmpl = fmt.get("entry_format", DEFAULTS["daily_format"]["entry_format"])
     try:
         header = entry_tmpl.format(
@@ -655,26 +742,148 @@ def format_entry(
             branch=branch,
         )
 
-    lines = [
-        f"<!-- session:{session_id} -->",
-        header,
-        f"> {summary}",
-    ]
+    marker = f"<!-- session:{session_id} -->"
+    summary_bullet = f"- {summary}"
 
+    # Build metadata parts for footnote or meta_line
+    home = str(Path.home())
+    meta_parts: list[str] = []
     if fmt.get("show_branch") and branch:
-        lines.append(f"> *Branch: `{branch}`*")
-
-    if fmt.get("show_tools") and transcript.get("tools_used"):
-        tools_list = ", ".join(transcript["tools_used"][:8])
-        lines.append(f"> *Tools: {tools_list}*")
-
+        meta_parts.append(f"`{branch}`")
+    if fmt.get("show_worktree") and worktree:
+        meta_parts.append(f"Worktree: `{worktree}`")
     if fmt.get("show_files") and transcript.get("files_modified"):
-        home = str(Path.home())
         short = [f.replace(home, "~") for f in transcript["files_modified"][:5]]
         files_list = ", ".join(f"`{f}`" for f in short)
-        lines.append(f"> *Files: {files_list}*")
+        meta_parts.append(f"Files: {files_list}")
+    if fmt.get("show_tools") and transcript.get("tools_used"):
+        tools_list = ", ".join(transcript["tools_used"][:8])
+        meta_parts.append(f"Tools: {tools_list}")
 
-    return "\n".join(lines)
+    if obsidian_mode:
+        # --- Obsidian mode: inline tag + footnote ref ---
+        tag_part = ""
+        if fmt.get("show_tags"):
+            tag_part = f" #session/{category}"
+
+        footnote = ""
+        fn_ref = ""
+        # Only create footnote if there's meaningful metadata beyond just branch 'main'
+        has_meaningful_meta = len(meta_parts) > 1 or (
+            len(meta_parts) == 1 and meta_parts[0] != "`main`"
+        )
+        if footnote_id and has_meaningful_meta and meta_parts:
+            fn_ref = f" [^s{footnote_id}]"
+            footnote = f"[^s{footnote_id}]: {' · '.join(meta_parts)}"
+
+        inline = f"{header} — {summary}{tag_part}{fn_ref}"
+        meta_line = ""
+        entry_block = f"{marker}\n{inline}"
+    else:
+        # --- Plain mode: compact blockquote meta ---
+        inline = f"{header} — {summary}"
+        if meta_parts:
+            meta_line = f"> {' · '.join(meta_parts)}"
+        else:
+            meta_line = ""
+        footnote = ""
+        entry_block = f"{marker}\n{inline}"
+        if meta_line:
+            entry_block += f"\n{meta_line}"
+
+    return {
+        "marker": marker,
+        "inline": inline,
+        "footnote": footnote,
+        "meta_line": meta_line,
+        "summary_bullet": summary_bullet,
+        "entry_block": entry_block,
+    }
+
+
+def _regenerate_summary(section_content: str, summary_heading: str) -> str:
+    """Parse inline entries and rebuild summary bullet list under summary_heading."""
+    # Extract summaries from inline entries: **HH:MM** category · duration — Summary text
+    pattern = r"\*\*\d{2}:\d{2}\*\*\s+\w+\s+·\s+.+?\s+—\s+(.+?)(?:\s+#session/|\s+\[\^s|\s*$)"
+    summaries: list[str] = []
+    for m in re.finditer(pattern, section_content, re.MULTILINE):
+        text = m.group(1).strip()
+        if text and text not in summaries:
+            summaries.append(text)
+
+    if not summaries:
+        return section_content
+
+    bullet_list = "\n".join(f"- {s}" for s in summaries)
+    heading_esc = re.escape(summary_heading)
+
+    # Find existing summary section
+    existing = re.search(
+        rf"^{heading_esc}\s*\n((?:- .+\n?)*)",
+        section_content,
+        re.MULTILINE,
+    )
+    if existing:
+        # Replace existing bullet list
+        return (
+            section_content[: existing.start(1)]
+            + bullet_list
+            + "\n"
+            + section_content[existing.end(1) :]
+        )
+
+    # No existing summary — insert after first blank line (before project headings)
+    # Find first ### heading (project heading)
+    first_project = re.search(r"^### ", section_content, re.MULTILINE)
+    if first_project:
+        insert_at = first_project.start()
+        return (
+            section_content[:insert_at]
+            + summary_heading
+            + "\n"
+            + bullet_list
+            + "\n\n"
+            + section_content[insert_at:]
+        )
+
+    # Fallback: prepend
+    return "\n" + summary_heading + "\n" + bullet_list + "\n\n" + section_content
+
+
+def _manage_footnotes(content: str, new_footnote: str, section_end: int) -> str:
+    """Insert or append footnote at the end of the notes section."""
+    if not new_footnote:
+        return content
+
+    # Find existing footnotes block (consecutive [^sN]: lines) near section end
+    section_content = content[:section_end]
+    last_fn = -1
+    for m in re.finditer(r"^\[\^s\d+\]:.*$", section_content, re.MULTILINE):
+        last_fn = m.end()
+
+    if last_fn != -1:
+        # Append after last footnote
+        return content[:last_fn] + "\n" + new_footnote + content[last_fn:]
+
+    # No existing footnotes — insert before section_end
+    # Add footnotes block with a blank line separator
+    insert_point = section_end
+    # Back up over trailing whitespace
+    while insert_point > 0 and content[insert_point - 1] in ("\n", " "):
+        insert_point -= 1
+    return (
+        content[:insert_point]
+        + "\n\n"
+        + new_footnote
+        + "\n"
+        + content[section_end:]
+    )
+
+
+def _next_footnote_id(content: str) -> int:
+    """Find next available [^sN] footnote number in content."""
+    existing = re.findall(r"\[\^s(\d+)\]", content)
+    return max((int(x) for x in existing), default=0) + 1
 
 
 # ---------------------------------------------------------------------------
@@ -720,17 +929,22 @@ def _find_or_create_project_section(
     for pat in patterns:
         match = re.search(f"^{pat}$", content, re.MULTILINE)
         if match:
-            # Found — find insertion point (after heading + possible blank line, before next ### or ##)
+            # Found — find insertion point (after heading + possible blank line,
+            # before next ### or ## heading or footnote block)
             pos = match.end()
             # Skip blank lines after heading
             while pos < len(content) and content[pos] in ("\n", "\r"):
                 pos += 1
-            # Find the end of this project's section (next ### or ## heading)
+            # Find the end of this project's section
+            candidates_insert: list[int] = []
             next_heading = re.search(r"^#{2,3} ", content[pos:], re.MULTILINE)
             if next_heading:
-                insert_at = pos + next_heading.start()
-            else:
-                insert_at = len(content)
+                candidates_insert.append(pos + next_heading.start())
+            # Stop before footnote definitions
+            next_fn = re.search(r"^\[\^s\d+\]:", content[pos:], re.MULTILINE)
+            if next_fn:
+                candidates_insert.append(pos + next_fn.start())
+            insert_at = min(candidates_insert) if candidates_insert else len(content)
             return content, insert_at
 
     # Not found — append project heading at end of content
@@ -743,7 +957,7 @@ def write_plain(
     output_dir: str,
     date_str: str,
     project: str,
-    entry: str,
+    entry: dict[str, str],
     config: dict[str, Any],
 ) -> Path:
     """Write entry to plain markdown daily file."""
@@ -759,16 +973,17 @@ def write_plain(
     else:
         content = file_path.read_text(encoding="utf-8")
 
+    entry_text = entry["entry_block"]
+
     if group_by_project:
         content, insert_at = _find_or_create_project_section(
             content, project, project_heading_tmpl, wikilinks=False
         )
-        # Insert entry at position
-        content = content[:insert_at] + entry + "\n\n" + content[insert_at:]
+        content = content[:insert_at] + entry_text + "\n\n" + content[insert_at:]
     else:
         if not content.endswith("\n"):
             content += "\n"
-        content += "\n" + entry + "\n"
+        content += "\n" + entry_text + "\n"
 
     _atomic_write(file_path, content)
     return file_path
@@ -812,7 +1027,7 @@ def write_obsidian(
     vault_path: str,
     date_str: str,
     project: str,
-    entry: str,
+    entry: dict[str, str],
     config: dict[str, Any],
 ) -> Path:
     """Write entry into Obsidian daily note under the configured section."""
@@ -847,13 +1062,11 @@ def write_obsidian(
     # Find section heading
     section_match = re.search(f"^{re.escape(section_heading)}$", content, re.MULTILINE)
     if not section_match:
-        # Append section at end
         content = content.rstrip() + f"\n\n{section_heading}\n\n"
         section_match = re.search(
             f"^{re.escape(section_heading)}$", content, re.MULTILINE
         )
 
-    # Work within the section
     section_start = section_match.end()
 
     # Find end of section (next ## heading)
@@ -867,12 +1080,37 @@ def write_obsidian(
         section_content, project, project_heading_tmpl, wikilinks=wikilinks
     )
 
-    # Insert entry
+    # Insert entry_block
     section_content = (
-        section_content[:insert_at] + entry + "\n\n" + section_content[insert_at:]
+        section_content[:insert_at]
+        + entry["entry_block"]
+        + "\n\n"
+        + section_content[insert_at:]
     )
 
+    # Rebuild full content with updated section
     content = content[:section_start] + section_content + content[section_end:]
+
+    # Recalculate section_end after insertion
+    next_section = re.search(r"^## ", content[section_start:], re.MULTILINE)
+    section_end = section_start + next_section.start() if next_section else len(content)
+
+    # Manage footnotes (Obsidian mode)
+    if entry.get("footnote"):
+        content = _manage_footnotes(content, entry["footnote"], section_end)
+
+    # Regenerate "Що зроблено" summary (Obsidian mode)
+    if fmt.get("daily_summary"):
+        summary_heading = fmt.get("summary_heading", "### Що зроблено")
+        # Recalculate section boundaries after footnote insertion
+        next_section = re.search(r"^## ", content[section_start:], re.MULTILINE)
+        section_end = (
+            section_start + next_section.start() if next_section else len(content)
+        )
+        section_content = content[section_start:section_end]
+        new_section = _regenerate_summary(section_content, summary_heading)
+        content = content[:section_start] + new_section + content[section_end:]
+
     _atomic_write(note_path, content)
     return note_path
 
@@ -887,6 +1125,41 @@ def get_project_name(cwd: str) -> str:
     if not cwd:
         return "unknown"
     return Path(cwd).name or "unknown"
+
+
+def get_git_worktree(cwd: str) -> str:
+    """Detect if cwd is a git worktree. Returns worktree path or empty string."""
+    if not cwd:
+        return ""
+    try:
+        git_dir = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--git-dir"],
+            capture_output=True, text=True, timeout=5,
+        )
+        common_dir = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if git_dir.returncode != 0 or common_dir.returncode != 0:
+            return ""
+        gd = Path(git_dir.stdout.strip()).resolve()
+        cd = Path(common_dir.stdout.strip()).resolve()
+        if gd != cd:
+            # This is a worktree — get its toplevel
+            toplevel = subprocess.run(
+                ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if toplevel.returncode == 0:
+                wt_path = toplevel.stdout.strip()
+                # Shorten home prefix to ~/
+                home = str(Path.home())
+                if wt_path.startswith(home):
+                    wt_path = "~" + wt_path[len(home):]
+                return wt_path
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return ""
 
 
 def get_git_branch(cwd: str) -> str:
@@ -1003,6 +1276,12 @@ def _run() -> None:
     end_ts = transcript.get("end_ts")
     duration_secs = (end_ts - start_ts) if (start_ts and end_ts) else 0.0
 
+    # 6a. min_duration check
+    min_dur = config.get("daily_format", {}).get("min_duration", 0)
+    if min_dur and duration_secs < min_dur:
+        _print_result("○", [f"skipped ({format_duration(duration_secs)} < min)"])
+        return
+
     # 7. Read existing note for LLM context (helps summarize resumed sessions)
     existing_note = ""
     if output_file.exists():
@@ -1017,6 +1296,15 @@ def _run() -> None:
     # 9. Format entry
     project = get_project_name(cwd)
     branch = get_git_branch(cwd)
+    worktree = get_git_worktree(cwd)
+
+    # Determine footnote_id for Obsidian mode
+    footnote_id = 0
+    if obsidian_enabled and existing_note:
+        footnote_id = _next_footnote_id(existing_note)
+    elif obsidian_enabled:
+        footnote_id = 1
+
     entry = format_entry(
         session_id=session_id,
         start_ts=start_ts,
@@ -1026,11 +1314,14 @@ def _run() -> None:
         transcript=transcript,
         config=config,
         branch=branch,
+        worktree=worktree,
+        footnote_id=footnote_id,
+        obsidian_mode=obsidian_enabled,
     )
 
     # 10. Write to output (update in-place for resume, append for new sessions)
     if is_resume:
-        replace_entry(output_file, session_id, entry)
+        replace_entry(output_file, session_id, entry, config=config)
         print(
             f"[session-digest] Updated (resume) {session_id[:8]} in {output_file}",
             file=sys.stderr,
