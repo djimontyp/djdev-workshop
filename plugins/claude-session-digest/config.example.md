@@ -1,10 +1,8 @@
 ---
 # Core settings
 output_dir: ~/daily-summaries
-model: sonnet
 language: null
 min_turns: 3
-quiet: false
 
 # Obsidian integration
 obsidian_enabled: false

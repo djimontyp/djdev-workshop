@@ -8,18 +8,18 @@ memory: global
 <discovery>
 <startup>
 1. Read `~/.claude/agent-memory/daily-assistant/MEMORY.md` — context from previous sessions and learned patterns
-2. Resolve config path (first found wins):
-   - `SESSION_DIGEST_CONFIG` env var
-   - `{cwd}/.claude/session-digest.local.md` — per-project
-   - `~/.claude/session-digest.local.md` — user-level
-3. Parse config frontmatter to get `output_dir`, `language`, `model`, `min_turns`, `obsidian_enabled`, `obsidian_vault_path`, `obsidian_daily_notes_dir`, `obsidian_date_format`, `obsidian_folder_format`, `obsidian_section_heading`, `obsidian_wikilinks`, `obsidian_template_path`
-4. Determine vault_path:
-   - If `obsidian_enabled=true` → use `obsidian_vault_path` as vault root
-   - If `obsidian_enabled=false` → plain mode, notes in `output_dir`
+2. Load config via CLI tool:
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/digest-cli.py" config
+   ```
+   Parse JSON output to get `output_dir`, `language`, `min_turns`, `obsidian.*`, `daily_format.*`
+3. Determine vault_path:
+   - If `obsidian.enabled=true` → use `obsidian.vault_path` as vault root
+   - If `obsidian.enabled=false` → plain mode, notes in `output_dir`
    - If config not found → ask user for vault path
-5. Detect output language: use `language` from config; if null, default to English; user can override with any language string (e.g. `uk`, `French`, `Українська`)
-6. Determine mode from user request (keywords: morning, checklist, analysis, note, summary, reflection, yesterday, week)
-7. If mode is unclear — ask: "What do you need? (morning / checklist / analysis / note / summary / reflection)"
+4. Detect output language: use `language` from config; if null, default to English; user can override with any language string (e.g. `uk`, `French`, `Українська`)
+5. Determine mode from user request (keywords: morning, checklist, analysis, note, summary, reflection, yesterday, week)
+6. If mode is unclear — ask: "What do you need? (morning / checklist / analysis / note / summary / reflection)"
 </startup>
 
 <vault_structure>
@@ -33,14 +33,22 @@ Use Glob to search: `{vault_path}/{daily_notes_dir}/{YYYY}/{MM}/*.md`
 </vault_structure>
 
 <sessions_awareness>
-This plugin automatically writes Claude Code sessions into daily notes.
+Query Claude Code sessions using the CLI tool:
 
-How to use:
-- **Morning/Analysis:** read today's or yesterday's daily note — session entries are already there under the configured `obsidian_section_heading` (default: `## Notes`)
-- **Summary:** sessions for the day are already aggregated — reference them
-- **Statistics:** `output_dir` from config contains `YYYY-MM-DD.md` files with all sessions
+```bash
+# List sessions for a specific date
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/digest-cli.py" list --date today
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/digest-cli.py" list --date yesterday
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/digest-cli.py" list --since YYYY-MM-DD
 
-Auto-written session format (Obsidian callout):
+# Get full session detail
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/digest-cli.py" show <session-id>
+
+# List projects with session counts
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/digest-cli.py" projects --since YYYY-MM-DD
+```
+
+Session entries in daily notes follow this format (Obsidian callout):
 ```markdown
 ### 🤖 [[project-name]]
 
@@ -56,8 +64,6 @@ Auto-written session format (Obsidian callout):
 > *Branch: `main` · Files: `auth.py`, `routes.py`*
 ```
 
-Plain mode uses blockquotes instead of callouts (same structure, no `> [!bot]-`).
-
 Each entry has:
 - `<!-- session:ID -->` marker for deduplication
 - `<!-- title:... -->` hidden title for summary generation
@@ -65,7 +71,11 @@ Each entry has:
 - Resume command: `claude --resume {session_id}`
 - Metadata: branch, files modified
 
-Factor these records into productivity analysis and summary preparation.
+How to use in modes:
+- **Morning:** `list --date yesterday` → yesterday's sessions for carry-over context
+- **Summary:** `list --date today` → today's sessions for evening summary; suggest running `/digest` if new sessions aren't in the daily note yet
+- **Analysis:** `list --since YYYY-MM-DD` + `projects --since YYYY-MM-DD` → aggregate statistics
+- **Existing entries:** Read daily note for already-written session entries under `section_heading`
 </sessions_awareness>
 
 <context_gathering>
@@ -150,19 +160,23 @@ You do NOT:
 
 <protocol>
 <mode_morning>
-1. Glob: find yesterday's daily note (YYYY-MM-DD-1) in `{vault_path}/{daily_notes_dir}/`
-2. Read: parse yesterday's note, extract:
+1. Query yesterday's sessions:
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/digest-cli.py" list --date yesterday
+   ```
+2. Glob: find yesterday's daily note in `{vault_path}/{daily_notes_dir}/`
+3. Read: parse yesterday's note, extract:
    - Open tasks (- [ ])
    - "Tomorrow" plans
-   - Claude sessions (auto-written under section_heading)
-3. Determine today's path: `{vault_path}/{daily_notes_dir}/YYYY/MM/YYYY-MM-DD.md`
-4. If does NOT exist:
+   - Session entries (under section_heading) — cross-reference with CLI output
+4. Determine today's path: `{vault_path}/{daily_notes_dir}/YYYY/MM/YYYY-MM-DD.md`
+5. If does NOT exist:
    - Check obsidian_template_path from config or use vault template
    - Create with frontmatter (Date: YYYY-MM-DD, tags: [daily])
    - Add Focus section: 2-3 items based on yesterday's tasks + recurring patterns
-5. If exists:
+6. If exists:
    - Edit: add/update Focus section
-6. Output: greeting with today's date, focus items, list of carry-overs from yesterday
+7. Output: greeting with today's date, focus items, list of carry-overs from yesterday
 </mode_morning>
 
 <mode_checklist>
@@ -181,35 +195,41 @@ You do NOT:
 
 <mode_analysis>
 1. Determine period: default 7 days or user-specified
-2. Glob: daily notes for period from `{vault_path}/{daily_notes_dir}/`
-3. Read: all notes (including Claude session sections)
-4. Analyze:
+2. Query sessions for the period:
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/digest-cli.py" list --since YYYY-MM-DD
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/digest-cli.py" projects --since YYYY-MM-DD
+   ```
+3. Glob: daily notes for period from `{vault_path}/{daily_notes_dir}/`
+4. Read: all notes (including Claude session sections)
+5. Analyze:
    - Closed tasks (- [x])
    - Open tasks (- [ ])
    - Learning insights (learning sections, inline insights)
    - Project mentions via wikilinks
-   - Claude sessions: count, categories (feature/bugfix/refactor), projects
-5. Output structured (in user's configured language):
+   - Claude sessions from CLI: count, duration, projects
+   - Cross-reference with daily note entries for categories
+6. Output structured (in user's configured language):
 ```
 ## Analysis for [period]
 
-### Done ✅
+### Done
 - [list with dates]
 
-### Open 🔲
+### Open
 - [list with dates]
 
-### Insights 💡
+### Insights
 - [learning moments]
 
 ### Projects
 - [[project-name]]: X mentions
 
 ### Claude sessions
-- Total: N sessions
+- Total: N sessions, Xh Ym total duration
 - [project]: M sessions (feature: X, bugfix: Y, ...)
 ```
-6. If significant insights: suggest creating a learning note
+7. If significant insights: suggest creating a learning note
 </mode_analysis>
 
 <mode_note>
@@ -224,14 +244,19 @@ You do NOT:
 </mode_note>
 
 <mode_summary>
-1. Read: today's daily note
-2. If does NOT exist: "No notes for today yet. Want to create a day summary?"
-3. Analyze:
+1. Query today's sessions:
+   ```bash
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/digest-cli.py" list --date today
+   ```
+2. Read: today's daily note
+3. If does NOT exist: "No notes for today yet. Want to create a day summary?"
+4. Check if there are new sessions not yet in the daily note — if so, suggest running `/digest` first
+5. Analyze:
    - Tasks: how many closed/open
    - Insights: any learning sections or inline insights
-   - Today's Claude sessions: what was worked on, time spent
+   - Today's Claude sessions: what was worked on, time spent (from CLI + daily note entries)
    - What to carry over to tomorrow
-4. Generate summary (in user's language):
+6. Generate summary (in user's language):
 ```
 ### Evening
 
@@ -245,8 +270,8 @@ You do NOT:
 #### Tomorrow
 - [open high-priority tasks]
 ```
-5. Edit: add/update summary section
-6. Output: summary + suggest creating learning note if insights found
+7. Edit: add/update summary section
+8. Output: summary + suggest creating learning note if insights found
 </mode_summary>
 
 <mode_reflection>

@@ -35,11 +35,6 @@ Ask the user these questions (use AskUserQuestion or conversational approach):
 - What language should summaries be written in? (default: null = English)
 - Examples: `uk`, `French`, `Українська`, `日本語`
 
-**4. AI model:**
-- `sonnet` (default, best quality)
-- `haiku` (faster, cheaper)
-- `null` (offline — no API calls, uses first message as description)
-
 ### Step 3: Create config file
 
 Create `~/.claude/session-digest.local.md` with the collected settings:
@@ -47,7 +42,6 @@ Create `~/.claude/session-digest.local.md` with the collected settings:
 ```markdown
 ---
 output_dir: {output_dir}
-model: {model}
 language: {language}
 min_turns: 3
 obsidian_enabled: {true/false}
@@ -61,7 +55,6 @@ group_by_project: true
 show_files: true
 show_branch: true
 daily_summary: true
-quiet: false
 ---
 ```
 
@@ -70,19 +63,18 @@ Only include obsidian_* keys if Obsidian mode was selected.
 ### Step 4: Verify
 
 1. Read back the created config and display it (like /digest-config)
-2. If output directory doesn't exist, mention it will be created on first session
+2. If output directory doesn't exist, mention it will be created on first run
 3. Show a summary:
 
 ```
-✅ session-digest configured!
+session-digest configured!
 
 Config: ~/.claude/session-digest.local.md
 Mode: {Plain/Obsidian}
 Output: {path}
-Model: {model}
 Language: {language or "English (default)"}
 
-Next session end will create your first digest entry.
+Run /digest to create your first entries.
 ```
 
 ### Step 5: Suggest project-level config (optional)

@@ -15,54 +15,52 @@ Show and validate the current claude-session-digest configuration.
 
 ## What to do when this command is invoked
 
-Resolve the config file path using the following cascade (first found wins):
+Run the CLI tool to get resolved configuration:
 
-1. `SESSION_DIGEST_CONFIG` env var — if set, use that path
-2. `{cwd}/.claude/session-digest.local.md` — per-project override
-3. `~/.claude/session-digest.local.md` — user-level defaults
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/digest-cli.py" config
+```
 
-Display the resolved path and configuration in a readable format:
+Parse the JSON output and display it in a readable format:
 
 ```
 claude-session-digest configuration
 ─────────────────────────────────────
-Config file: ~/.claude/session-digest.local.md
+Config file: {config_path}
 
 Core settings:
-  output_dir:  ~/Documents/daily-summaries
-  model:       sonnet  (AI summaries enabled)
-  language:    null
-  min_turns:   3
-  quiet:       false
+  output_dir:  {output_dir}
+  language:    {language}
+  min_turns:   {min_turns}
 
 Obsidian:
-  enabled:        false  (plain mode — writing to output_dir)
+  enabled:        {obsidian.enabled}
 ```
 
-When `obsidian_enabled=true`, also show all sub-keys:
+When `obsidian.enabled=true`, also show all obsidian sub-keys:
 
 ```
 Obsidian:
   enabled:         true  (Obsidian mode — writing to vault)
-  vault_path:      ~/Documents/Obsidian
-  daily_notes_dir: Daily notes
-  date_format:     YYYY-MM-DD
-  folder_format:   YYYY/MM
-  section_heading: ## Notes
-  wikilinks:       true
-  template_path:   null
+  vault_path:      {obsidian.vault_path}
+  daily_notes_dir: {obsidian.daily_notes_dir}
+  date_format:     {obsidian.date_format}
+  folder_format:   {obsidian.folder_format}
+  section_heading: {obsidian.section_heading}
+  wikilinks:       {obsidian.wikilinks}
+  template_path:   {obsidian.template_path}
 
 Format:
-  group_by_project: true
-  show_files:       true
-  show_branch:      true
-  project_heading:  "### 🤖 {project}"
+  group_by_project: {daily_format.group_by_project}
+  show_files:       {daily_format.show_files}
+  show_branch:      {daily_format.show_branch}
+  project_heading:  {daily_format.project_heading}
 ```
 
-If no config file is found at any location:
+If `config_path` is null (no config found):
 
 ```
-⚠️  No config found.
+No config found.
 
 To get started:
 1. Copy the example config:
@@ -82,5 +80,5 @@ If the file exists but has parse errors (missing frontmatter or malformed YAML),
 After showing the config, if `output_dir` is set, check whether that directory exists. If not, mention it:
 
 ```
-Note: output_dir /path/to/dir does not exist yet — it will be created on first session.
+Note: output_dir /path/to/dir does not exist yet — it will be created when you run /digest.
 ```
